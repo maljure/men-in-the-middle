@@ -6,7 +6,7 @@
 
 ---
 
-## Phase 1 — TLS Interception Layer <font color="green">COMPLETE.</font>
+## Phase 1 — TLS Interception Layer || $${\color{green}COMPLETE}$$| 
 
 - Generate a root CA cert and key on first run, persist to disk
 - Build a dynamic cert factory that signs per-hostname certs from your CA
