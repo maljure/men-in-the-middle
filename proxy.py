@@ -1,68 +1,58 @@
 import socket
+import ssl
 import threading
 import ipaddress
 import logging
 from concurrent.futures import ThreadPoolExecutor
 
-# ---------------------------------------------------------------------------
+import tls
+
 # Logging
-# ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Security configuration
-# ---------------------------------------------------------------------------
 
-# Ports allowed for CONNECT tunnels (HTTPS, alt-HTTPS, common dev ports)
+# Security config
 ALLOWED_CONNECT_PORTS = {443, 8443, 8080, 8888}
 
-# RFC-1918 + loopback + link-local — block to prevent SSRF
+# RFC-1918 + loopback + link-local 
 BLOCKED_NETWORKS = [
     ipaddress.ip_network("127.0.0.0/8"),
     ipaddress.ip_network("10.0.0.0/8"),
     ipaddress.ip_network("172.16.0.0/12"),
     ipaddress.ip_network("192.168.0.0/16"),
-    ipaddress.ip_network("169.254.0.0/16"),  # AWS metadata, link-local
-    ipaddress.ip_network("::1/128"),          # IPv6 loopback
-    ipaddress.ip_network("fc00::/7"),         # IPv6 ULA
+    ipaddress.ip_network("169.254.0.0/16"), 
+    ipaddress.ip_network("::1/128"),     
+    ipaddress.ip_network("fc00::/7"),     
 ]
 
 # Maximum concurrent client threads
 MAX_WORKERS = 100
 
-# Relay / read timeout in seconds
+# Relay/read timeout
 RELAY_TIMEOUT = 10
 
-# Maximum size of HTTP request headers (64 KB) — prevents slow-header DoS
+# Maximum size of HTTP request headers
 MAX_HEADER_SIZE = 65536
 
-# ---------------------------------------------------------------------------
-# Cert cache (populated later when TLS MITM is added)
-# ---------------------------------------------------------------------------
-_cert_cache: dict = {}
-_cert_cache_lock = threading.Lock()
+# Set False only for upstream servers with self-signed certs. Just for testing.
+VERIFY_UPSTREAM_CERT = True
 
 
-def get_cached_cert(hostname: str):
-    """Return a cached (cert, key) pair for hostname, or None."""
-    with _cert_cache_lock:
-        return _cert_cache.get(hostname)
+# CA
+_ca_cert = None
+_ca_key = None
 
 
-def store_cert(hostname: str, cert, key) -> None:
-    """Cache a (cert, key) pair for hostname."""
-    with _cert_cache_lock:
-        _cert_cache[hostname] = (cert, key)
+def _load_ca() -> None:
+    global _ca_cert, _ca_key
+    _ca_cert, _ca_key = tls.load_or_create_ca()
 
 
-# ---------------------------------------------------------------------------
-# SSRF guard — resolves once, reuses IP to prevent DNS rebinding
-# ---------------------------------------------------------------------------
-
+# SSRF guard
 def resolve_and_check(host: str) -> str | None:
     """
     Resolve host to an IP, verify it is not in a blocked range, and return
@@ -84,10 +74,7 @@ def resolve_and_check(host: str) -> str | None:
         return None
 
 
-# ---------------------------------------------------------------------------
 # Socket relay helpers
-# ---------------------------------------------------------------------------
-
 def forward(src: socket.socket, dst: socket.socket) -> None:
     """Relay data from src -> dst until the connection closes."""
     try:
@@ -119,10 +106,7 @@ def send_error(client_socket: socket.socket, status_code: int, reason: str) -> N
         pass
 
 
-# ---------------------------------------------------------------------------
 # Request parsing
-# ---------------------------------------------------------------------------
-
 def read_request_headers(client_socket: socket.socket):
     """
     Read bytes from client until the end of HTTP headers (\\r\\n\\r\\n).
@@ -155,12 +139,19 @@ def read_request_headers(client_socket: socket.socket):
     return raw, header_text, lines, method, url
 
 
-# ---------------------------------------------------------------------------
-# CONNECT tunnel handler
-# ---------------------------------------------------------------------------
 
+# CONNECT tunnel handler
 def handle_connect(client_socket: socket.socket, url: str) -> None:
-    """Set up a transparent TCP tunnel for HTTPS CONNECT requests."""
+    """
+    TLS MITM handler for HTTPS CONNECT requests.
+
+    Flow:
+      1. Parse host:port from the CONNECT target.
+      2. Connect to the real upstream server with TLS (verifying its cert).
+      3. Tell the client the tunnel is ready (200 Connection Established).
+      4. Wrap the client socket with TLS using a dynamically signed leaf cert.
+      5. Relay decrypted plaintext bidirectionally.
+    """
     try:
         host, port_str = url.rsplit(":", 1)
         port = int(port_str)
@@ -168,7 +159,6 @@ def handle_connect(client_socket: socket.socket, url: str) -> None:
         send_error(client_socket, 400, "Bad Request")
         return
 
-    # Restrict tunneling to allowed ports
     if port not in ALLOWED_CONNECT_PORTS:
         log.warning("CONNECT to disallowed port %d blocked", port)
         send_error(client_socket, 403, "Forbidden")
@@ -180,32 +170,41 @@ def handle_connect(client_socket: socket.socket, url: str) -> None:
         send_error(client_socket, 403, "Forbidden")
         return
 
+    # Connect to upstream with TLS and verify cert
     try:
-        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server_socket.settimeout(RELAY_TIMEOUT)
-        server_socket.connect((ip, port))
+        raw_server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        raw_server_sock.settimeout(RELAY_TIMEOUT)
+        raw_server_sock.connect((ip, port))
+        upstream_ctx = tls.make_upstream_context(verify=VERIFY_UPSTREAM_CERT)
+        server_sock = upstream_ctx.wrap_socket(raw_server_sock, server_hostname=host)
+    except ssl.SSLCertVerificationError as exc:
+        log.warning("Upstream cert verification failed for %s: %s", host, exc)
+        send_error(client_socket, 502, "Bad Gateway")
+        return
     except Exception as exc:
-        log.error("CONNECT failed to %s:%d - %s", host, port, exc)
+        log.error("CONNECT upstream TLS failed for %s:%d — %s", host, port, exc)
         send_error(client_socket, 502, "Bad Gateway")
         return
 
     client_socket.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-    log.info("CONNECT tunnel opened: %s:%d", host, port)
+    try:
+        client_ctx = tls.get_host_ssl_context(host, _ca_cert, _ca_key)
+        client_tls = client_ctx.wrap_socket(client_socket, server_side=True)
+    except Exception as exc:
+        log.error("Client TLS handshake failed for %s — %s", host, exc)
+        server_sock.close()
+        return
 
-    # Bidirectional relay — both threads are daemon so they don't block shutdown
-    t1 = threading.Thread(target=forward, args=(client_socket, server_socket), daemon=True)
-    t2 = threading.Thread(target=forward, args=(server_socket, client_socket), daemon=True)
+    log.info("TLS MITM established: %s:%d", host, port)
+    t1 = threading.Thread(target=forward, args=(client_tls, server_sock), daemon=True)
+    t2 = threading.Thread(target=forward, args=(server_sock, client_tls), daemon=True)
     t1.start()
     t2.start()
     t1.join()
     t2.join()
-    log.info("CONNECT tunnel closed: %s:%d", host, port)
+    log.info("TLS MITM closed: %s:%d", host, port)
 
-
-# ---------------------------------------------------------------------------
 # Plain HTTP handler
-# ---------------------------------------------------------------------------
-
 def handle_http(
     client_socket: socket.socket,
     raw_request: bytes,
@@ -218,7 +217,7 @@ def handle_http(
 
     if url.startswith("http"):
         try:
-            host_part = url.split("/", 3)[2]  # "example.com" or "example.com:8080"
+            host_part = url.split("/", 3)[2]
             if ":" in host_part:
                 host, port_str = host_part.rsplit(":", 1)
                 port = int(port_str)
@@ -228,7 +227,7 @@ def handle_http(
             send_error(client_socket, 400, "Bad Request")
             return
     else:
-        # Relative URL — derive host from Host header
+        # Relative URL
         for line in lines[1:]:
             if line.lower().startswith("host:"):
                 host_header = line.split(":", 1)[1].strip()
@@ -247,7 +246,7 @@ def handle_http(
         send_error(client_socket, 400, "Bad Request")
         return
 
-    # Resolve once — reuse IP to prevent DNS rebinding
+    # Resolve once
     ip = resolve_and_check(host)
     if not ip:
         send_error(client_socket, 403, "Forbidden")
@@ -265,10 +264,7 @@ def handle_http(
     log.info("HTTP %s -> %s:%d", lines[0] if lines else "?", host, port)
 
     try:
-        # Forward the full raw request (headers + any early body bytes)
         server_socket.sendall(raw_request)
-
-        # Stream response back to client
         server_socket.settimeout(RELAY_TIMEOUT)
         while True:
             chunk = server_socket.recv(4096)
@@ -282,11 +278,7 @@ def handle_http(
     finally:
         server_socket.close()
 
-
-# ---------------------------------------------------------------------------
 # Per-client dispatcher
-# ---------------------------------------------------------------------------
-
 def handle_client(client_socket: socket.socket, address: tuple) -> None:
     """Parse the incoming request and dispatch to the correct handler."""
     try:
@@ -314,13 +306,10 @@ def handle_client(client_socket: socket.socket, address: tuple) -> None:
         except Exception:
             pass
 
-
-# ---------------------------------------------------------------------------
 # Server entry point
-# ---------------------------------------------------------------------------
-
 def start_proxy(host: str = "127.0.0.1", port: int = 8888) -> None:
     """Bind and serve the proxy, dispatching clients to a thread pool."""
+    _load_ca()
     proxy_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     proxy_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     proxy_socket.bind((host, port))
