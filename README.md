@@ -46,7 +46,7 @@
 
 ---
 
-## Phase 5 — CLI Interface
+## Phase 5 — CLI Interface $${\color{orange}IN PROGRESS - CHASE}$$
 
 - Live traffic feed printed to terminal
 - Intercept mode toggle
