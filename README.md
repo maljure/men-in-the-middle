@@ -17,7 +17,7 @@
 
 ---
 
-## Phase 2 — HTTP Parser
+## Phase 2 — HTTP Parser || $${\color{green}COMPLETE}$$
 
 - Parse raw bytes into structured request/response objects (method, path, headers dict, body)
 - Handle chunked transfer encoding
