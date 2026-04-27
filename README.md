@@ -37,7 +37,7 @@
 
 ---
 
-## Phase 4 — History Log || $${\color{orange}IN_PROGRESS - MASON}$$
+## Phase 4 — History Log || $${\color{orange}IN PROGRESS - MASON}$$
 
 - Store every request/response pair to SQLite
 - Index by host, method, status code, timestamp
