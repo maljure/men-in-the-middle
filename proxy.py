@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
 
 import http_parser
+import intercept
 import tls
 
 # Logging
@@ -184,12 +185,28 @@ def handle_connect(client_socket: socket.socket, url: str) -> None:
 
         log.info("HTTPS %s %s %s", req.method, req.path, host)
 
+        req = intercept.engine.intercept_request(req)
+        if req is None:
+            log.info("HTTPS request to %s dropped by intercept engine", host)
+            send_error(client_tls, 502, "Bad Gateway")
+            break
+
         try:
             server_sock.sendall(req.to_bytes())
             resp = http_parser.HTTPResponse.from_socket(server_sock, req.method)
-            client_tls.sendall(resp.to_bytes())
         except Exception as exc:
             log.error("HTTPS relay error for %s: %s", host, exc)
+            break
+
+        resp = intercept.engine.intercept_response(resp)
+        if resp is None:
+            log.info("HTTPS response from %s dropped by intercept engine", host)
+            break
+
+        try:
+            client_tls.sendall(resp.to_bytes())
+        except Exception as exc:
+            log.error("HTTPS client send error for %s: %s", host, exc)
             break
 
         if not req.is_keep_alive() or not resp.is_keep_alive():
@@ -244,12 +261,28 @@ def handle_http(
 
         log.info("HTTP %s %s -> %s:%d", req.method, req.path, host, port)
 
+        req = intercept.engine.intercept_request(req)
+        if req is None:
+            log.info("HTTP request to %s dropped by intercept engine", host)
+            send_error(client_socket, 502, "Bad Gateway")
+            break
+
         try:
             server_socket.sendall(_to_relative(req).to_bytes())
             resp = http_parser.HTTPResponse.from_socket(server_socket, req.method)
-            client_socket.sendall(resp.to_bytes())
         except Exception as exc:
             log.error("HTTP relay error for %s: %s", host, exc)
+            break
+
+        resp = intercept.engine.intercept_response(resp)
+        if resp is None:
+            log.info("HTTP response from %s dropped by intercept engine", host)
+            break
+
+        try:
+            client_socket.sendall(resp.to_bytes())
+        except Exception as exc:
+            log.error("HTTP client send error for %s: %s", host, exc)
             break
 
         if not req.is_keep_alive() or not resp.is_keep_alive():

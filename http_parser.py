@@ -1,13 +1,13 @@
 """Phase 2 — HTTP/1.x parser.
 
 Parse raw bytes or socket streams into HTTPRequest / HTTPResponse objects,
-then re-serialise after inspection or modification.
+then re-serialize after inspection or modification.
 
 Supports:
-  - Chunked transfer-encoding (decoded on parse, removed on serialise)
+  - Chunked transfer-encoding (decoded on parse, removed on serialize)
   - gzip / deflate / br decompression (re-compressed if recompress=True)
   - Keep-alive / connection-reuse detection
-  - Header order and original capitalisation preserved on re-serialisation
+  - Header order and original capitalisation preserved on re-serialization
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ MAX_HEADER_BYTES = 65_536       # 64 KB
 MAX_BODY_BYTES   = 52_428_800   # 50 MB
 
 
-# ── socket helpers ────────────────────────────────────────────────────────────
+# Socket Helpers — read from a live socket until we have enough to parse headers, then
 
 def _recv_until_crlf2(sock: socket.socket) -> bytes:
     """Read from *sock* until \\r\\n\\r\\n, enforcing MAX_HEADER_BYTES."""
@@ -63,7 +63,7 @@ def _recv_until_close(sock: socket.socket, seed: bytes = b"") -> bytes:
     return bytes(buf)
 
 
-# ── chunked transfer-encoding ─────────────────────────────────────────────────
+# Chunked transfer-encoding decoder — supports streaming from a live socket or decoding from a fully buffered byte string. Enforces MAX_BODY_BYTES to avoid OOM.
 
 class _SockBuf:
     """Drain *seed* bytes first, then pull from *sock* on demand."""
@@ -129,7 +129,7 @@ def _decode_chunked_bytes(data: bytes) -> bytes:
     return out.getvalue()
 
 
-# ── compression ───────────────────────────────────────────────────────────────
+# Compression helpers — handle gzip / deflate / br content-encoding, with optional recompression on serialization. Raises if brotli is needed but not installed.
 
 def _decompress(data: bytes, encoding: str) -> bytes:
     enc = encoding.lower().strip()
@@ -168,8 +168,7 @@ def _compress(data: bytes, encoding: str) -> bytes:
     return data
 
 
-# ── header parsing ────────────────────────────────────────────────────────────
-
+# Header parsing — split raw header lines into a dict with lower-cased keys for lookup, and a list of (original-case name, value) pairs for re-serialization. Duplicate headers are combined with ', ' as per RFC 7230 Section 3.2.2.
 def _parse_headers(
     lines: list[str],
 ) -> tuple[dict[str, str], list[tuple[str, str]]]:
@@ -192,7 +191,7 @@ def _parse_headers(
     return headers, raw
 
 
-# ── body reader ───────────────────────────────────────────────────────────────
+# Body reader — given a socket, already-parsed headers, and any leftover bytes from header parsing, read the full body according to Content-Length or Transfer-Encoding, with optional decompression. For responses with no framing info, read until the server closes the connection (connection-close semantics). Enforces MAX_BODY_BYTES to avoid OOM.
 
 def _read_body(
     sock: socket.socket,
@@ -236,7 +235,7 @@ def _read_body(
     return body
 
 
-# ── serialisation helper ──────────────────────────────────────────────────────
+# Serialization helpers — given a body, raw headers, and header dict, strip framing/encoding headers, optionally recompress, then set Content-Length. Used by HTTPRequest.to_bytes() and HTTPResponse.to_bytes() to ensure consistent handling of framing and encoding on serialization.
 
 def _build_headers_for_wire(
     body: bytes,
@@ -338,11 +337,11 @@ class HTTPRequest:
             headers=headers, raw_headers=raw_headers, body=body_bytes,
         )
 
-    # ── serialisation ─────────────────────────────────────────────────────────
+    # serialization
 
     def to_bytes(self, *, recompress: bool = False) -> bytes:
         """
-        Serialise to HTTP wire bytes.
+        Serialize to HTTP wire bytes.
 
         Transfer-Encoding is always removed; Content-Length is set from body.
         Content-Encoding is removed unless recompress=True (body re-compressed).
