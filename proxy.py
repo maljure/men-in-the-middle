@@ -1,10 +1,12 @@
+import dataclasses
 import socket
 import ssl
-import threading
 import ipaddress
 import logging
 from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urlparse
 
+import http_parser
 import tls
 
 # Logging
@@ -18,15 +20,15 @@ log = logging.getLogger(__name__)
 # Security config
 ALLOWED_CONNECT_PORTS = {443, 8443, 8080, 8888}
 
-# RFC-1918 + loopback + link-local 
+# RFC-1918 + loopback + link-local
 BLOCKED_NETWORKS = [
     ipaddress.ip_network("127.0.0.0/8"),
     ipaddress.ip_network("10.0.0.0/8"),
     ipaddress.ip_network("172.16.0.0/12"),
     ipaddress.ip_network("192.168.0.0/16"),
-    ipaddress.ip_network("169.254.0.0/16"), 
-    ipaddress.ip_network("::1/128"),     
-    ipaddress.ip_network("fc00::/7"),     
+    ipaddress.ip_network("169.254.0.0/16"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),
 ]
 
 # Maximum concurrent client threads
@@ -74,26 +76,7 @@ def resolve_and_check(host: str) -> str | None:
         return None
 
 
-# Socket relay helpers
-def forward(src: socket.socket, dst: socket.socket) -> None:
-    """Relay data from src -> dst until the connection closes."""
-    try:
-        while True:
-            data = src.recv(4096)
-            if not data:
-                break
-            dst.sendall(data)
-    except Exception:
-        pass
-    finally:
-        for sock in (src, dst):
-            try:
-                sock.close()
-            except Exception:
-                pass
-
-
-def send_error(client_socket: socket.socket, status_code: int, reason: str) -> None:
+def send_error(sock: socket.socket, status_code: int, reason: str) -> None:
     """Send a minimal HTTP error response."""
     response = (
         f"HTTP/1.1 {status_code} {reason}\r\n"
@@ -101,43 +84,33 @@ def send_error(client_socket: socket.socket, status_code: int, reason: str) -> N
         f"Connection: close\r\n\r\n"
     )
     try:
-        client_socket.sendall(response.encode("utf-8"))
+        sock.sendall(response.encode("utf-8"))
     except Exception:
         pass
 
 
-# Request parsing
-def read_request_headers(client_socket: socket.socket):
-    """
-    Read bytes from client until the end of HTTP headers (\\r\\n\\r\\n).
+# HTTP target helpers
+def _http_target(req: http_parser.HTTPRequest) -> tuple[str, int]:
+    """Extract (host, port) from a plain-HTTP proxy request."""
+    if req.path.startswith(("http://", "https://")):
+        parsed = urlparse(req.path)
+        host = parsed.hostname or ""
+        port = parsed.port or (443 if req.path.startswith("https") else 80)
+        return host, port
+    host_hdr = (req.header("host") or "").strip()
+    if ":" in host_hdr:
+        h, _, p = host_hdr.rpartition(":")
+        return h, int(p)
+    return host_hdr, 80
 
-    Raises ValueError on:
-      - client disconnect before headers complete
-      - headers exceeding MAX_HEADER_SIZE (slow-header / header-flood DoS)
-      - malformed request line
 
-    Returns (raw_request_bytes, header_text, lines, method, url).
-    """
-    raw = b""
-    while b"\r\n\r\n" not in raw:
-        chunk = client_socket.recv(4096)
-        if not chunk:
-            raise ValueError("Client closed connection before sending headers")
-        raw += chunk
-        if len(raw) > MAX_HEADER_SIZE:
-            raise ValueError(f"Headers exceeded {MAX_HEADER_SIZE} bytes — possible DoS")
-
-    header_part, _, _ = raw.partition(b"\r\n\r\n")
-    header_text = header_part.decode("utf-8", errors="ignore")
-    lines = header_text.split("\r\n")
-
-    first_line = lines[0].split()
-    if len(first_line) < 2:
-        raise ValueError(f"Malformed request line: {lines[0]!r}")
-
-    method, url = first_line[0], first_line[1]
-    return raw, header_text, lines, method, url
-
+def _to_relative(req: http_parser.HTTPRequest) -> http_parser.HTTPRequest:
+    """Return a copy of *req* with an absolute-URL path stripped to relative."""
+    if not req.path.startswith(("http://", "https://")):
+        return req
+    parsed = urlparse(req.path)
+    rel = (parsed.path or "/") + (("?" + parsed.query) if parsed.query else "")
+    return dataclasses.replace(req, path=rel)
 
 
 # CONNECT tunnel handler
@@ -150,7 +123,8 @@ def handle_connect(client_socket: socket.socket, url: str) -> None:
       2. Connect to the real upstream server with TLS (verifying its cert).
       3. Tell the client the tunnel is ready (200 Connection Established).
       4. Wrap the client socket with TLS using a dynamically signed leaf cert.
-      5. Relay decrypted plaintext bidirectionally.
+      5. Parse HTTP request/response pairs through the tunnel until either side
+         closes the connection or signals Connection: close.
     """
     try:
         host, port_str = url.rsplit(":", 1)
@@ -196,94 +170,109 @@ def handle_connect(client_socket: socket.socket, url: str) -> None:
         return
 
     log.info("TLS MITM established: %s:%d", host, port)
-    t1 = threading.Thread(target=forward, args=(client_tls, server_sock), daemon=True)
-    t2 = threading.Thread(target=forward, args=(server_sock, client_tls), daemon=True)
-    t1.start()
-    t2.start()
-    t1.join()
-    t2.join()
+
+    # Parse and relay HTTP request/response pairs through the decrypted tunnel
+    while True:
+        try:
+            req = http_parser.HTTPRequest.from_socket(client_tls)
+        except (ConnectionResetError, OSError):
+            break
+        except ValueError as exc:
+            log.warning("Bad HTTPS request from %s — %s", host, exc)
+            send_error(client_tls, 400, "Bad Request")
+            break
+
+        log.info("HTTPS %s %s %s", req.method, req.path, host)
+
+        try:
+            server_sock.sendall(req.to_bytes())
+            resp = http_parser.HTTPResponse.from_socket(server_sock, req.method)
+            client_tls.sendall(resp.to_bytes())
+        except Exception as exc:
+            log.error("HTTPS relay error for %s: %s", host, exc)
+            break
+
+        if not req.is_keep_alive() or not resp.is_keep_alive():
+            break
+
     log.info("TLS MITM closed: %s:%d", host, port)
+    for sock in (server_sock, client_tls):
+        try:
+            sock.close()
+        except Exception:
+            pass
+
 
 # Plain HTTP handler
 def handle_http(
     client_socket: socket.socket,
-    raw_request: bytes,
-    lines: list[str],
-    url: str,
+    req: http_parser.HTTPRequest,
 ) -> None:
-    """Forward a plain HTTP request and stream the response back."""
-    host = None
-    port = 80
+    """Forward plain HTTP request/response pairs. Reuses the upstream connection
+    across keep-alive requests to the same host."""
+    server_socket: socket.socket | None = None
+    current_host: str | None = None
+    current_port: int | None = None
 
-    if url.startswith("http"):
-        try:
-            host_part = url.split("/", 3)[2]
-            if ":" in host_part:
-                host, port_str = host_part.rsplit(":", 1)
-                port = int(port_str)
-            else:
-                host = host_part
-        except (IndexError, ValueError):
+    while True:
+        host, port = _http_target(req)
+        if not host:
             send_error(client_socket, 400, "Bad Request")
-            return
-    else:
-        # Relative URL
-        for line in lines[1:]:
-            if line.lower().startswith("host:"):
-                host_header = line.split(":", 1)[1].strip()
-                if ":" in host_header:
-                    host, port_str = host_header.rsplit(":", 1)
-                    try:
-                        port = int(port_str)
-                    except ValueError:
-                        send_error(client_socket, 400, "Bad Request")
-                        return
-                else:
-                    host = host_header
+            break
+
+        ip = resolve_and_check(host)
+        if not ip:
+            send_error(client_socket, 403, "Forbidden")
+            break
+
+        # Open a new upstream connection only when target changes
+        if server_socket is None or host != current_host or port != current_port:
+            if server_socket:
+                try:
+                    server_socket.close()
+                except Exception:
+                    pass
+            try:
+                server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                server_socket.settimeout(RELAY_TIMEOUT)
+                server_socket.connect((ip, port))
+                current_host, current_port = host, port
+            except Exception as exc:
+                log.error("HTTP connect failed %s:%d — %s", host, port, exc)
+                send_error(client_socket, 502, "Bad Gateway")
                 break
 
-    if not host:
-        send_error(client_socket, 400, "Bad Request")
-        return
+        log.info("HTTP %s %s -> %s:%d", req.method, req.path, host, port)
 
-    # Resolve once
-    ip = resolve_and_check(host)
-    if not ip:
-        send_error(client_socket, 403, "Forbidden")
-        return
+        try:
+            server_socket.sendall(_to_relative(req).to_bytes())
+            resp = http_parser.HTTPResponse.from_socket(server_socket, req.method)
+            client_socket.sendall(resp.to_bytes())
+        except Exception as exc:
+            log.error("HTTP relay error for %s: %s", host, exc)
+            break
 
-    try:
-        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server_socket.settimeout(RELAY_TIMEOUT)
-        server_socket.connect((ip, port))
-    except Exception as exc:
-        log.error("HTTP connection failed to %s:%d - %s", host, port, exc)
-        send_error(client_socket, 502, "Bad Gateway")
-        return
+        if not req.is_keep_alive() or not resp.is_keep_alive():
+            break
 
-    log.info("HTTP %s -> %s:%d", lines[0] if lines else "?", host, port)
+        try:
+            req = http_parser.HTTPRequest.from_socket(client_socket)
+        except (ConnectionResetError, ValueError, OSError):
+            break
 
-    try:
-        server_socket.sendall(raw_request)
-        server_socket.settimeout(RELAY_TIMEOUT)
-        while True:
-            chunk = server_socket.recv(4096)
-            if not chunk:
-                break
-            client_socket.sendall(chunk)
-    except socket.timeout:
-        pass  # Server finished sending
-    except Exception as exc:
-        log.error("Error relaying HTTP response: %s", exc)
-    finally:
-        server_socket.close()
+    if server_socket:
+        try:
+            server_socket.close()
+        except Exception:
+            pass
+
 
 # Per-client dispatcher
 def handle_client(client_socket: socket.socket, address: tuple) -> None:
     """Parse the incoming request and dispatch to the correct handler."""
     try:
-        raw_request, header_text, lines, method, url = read_request_headers(client_socket)
-    except ValueError as exc:
+        req = http_parser.HTTPRequest.from_socket(client_socket)
+    except (ValueError, ConnectionResetError) as exc:
         log.warning("Bad request from %s: %s", address, exc)
         send_error(client_socket, 400, "Bad Request")
         try:
@@ -293,10 +282,10 @@ def handle_client(client_socket: socket.socket, address: tuple) -> None:
         return
 
     try:
-        if method == "CONNECT":
-            handle_connect(client_socket, url)
+        if req.method == "CONNECT":
+            handle_connect(client_socket, req.path)
         else:
-            handle_http(client_socket, raw_request, lines, url)
+            handle_http(client_socket, req)
     except Exception as exc:
         log.exception("Unexpected error handling %s: %s", address, exc)
         send_error(client_socket, 500, "Internal Server Error")
@@ -305,6 +294,7 @@ def handle_client(client_socket: socket.socket, address: tuple) -> None:
             client_socket.close()
         except Exception:
             pass
+
 
 # Server entry point
 def start_proxy(host: str = "127.0.0.1", port: int = 8888) -> None:
