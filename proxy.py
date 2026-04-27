@@ -1,7 +1,7 @@
+import os
 import dataclasses
 import socket
 import ssl
-import ipaddress
 import logging
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
@@ -17,21 +17,6 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-
-# Security config
-ALLOWED_CONNECT_PORTS = {443, 8443, 8080, 8888}
-
-# RFC-1918 + loopback + link-local
-BLOCKED_NETWORKS = [
-    ipaddress.ip_network("127.0.0.0/8"),
-    ipaddress.ip_network("10.0.0.0/8"),
-    ipaddress.ip_network("172.16.0.0/12"),
-    ipaddress.ip_network("192.168.0.0/16"),
-    ipaddress.ip_network("169.254.0.0/16"),
-    ipaddress.ip_network("::1/128"),
-    ipaddress.ip_network("fc00::/7"),
-]
-
 # Maximum concurrent client threads
 MAX_WORKERS = 100
 
@@ -41,41 +26,16 @@ RELAY_TIMEOUT = 10
 # Maximum size of HTTP request headers
 MAX_HEADER_SIZE = 65536
 
-# Set False only for upstream servers with self-signed certs. Just for testing.
-VERIFY_UPSTREAM_CERT = True
-
+# Disabled upstream verification to allow self-signed certs (e.g., IoT, local dev, CTF targets)
+VERIFY_UPSTREAM_CERT = False
 
 # CA
 _ca_cert = None
 _ca_key = None
 
-
 def _load_ca() -> None:
     global _ca_cert, _ca_key
     _ca_cert, _ca_key = tls.load_or_create_ca()
-
-
-# SSRF guard
-def resolve_and_check(host: str) -> str | None:
-    """
-    Resolve host to an IP, verify it is not in a blocked range, and return
-    the IP string so the caller can connect directly (avoiding a second DNS
-    lookup that a rebinding attack could swap).
-
-    Returns None if the host is unsafe or resolution fails.
-    """
-    try:
-        ip_str = socket.gethostbyname(host)
-        resolved = ipaddress.ip_address(ip_str)
-        for net in BLOCKED_NETWORKS:
-            if resolved in net:
-                log.warning("SSRF block: %s resolved to %s", host, ip_str)
-                return None
-        return ip_str
-    except Exception as exc:
-        log.warning("Host resolution failed for %s: %s", host, exc)
-        return None
-
 
 def send_error(sock: socket.socket, status_code: int, reason: str) -> None:
     """Send a minimal HTTP error response."""
@@ -88,7 +48,6 @@ def send_error(sock: socket.socket, status_code: int, reason: str) -> None:
         sock.sendall(response.encode("utf-8"))
     except Exception:
         pass
-
 
 # HTTP target helpers
 def _http_target(req: http_parser.HTTPRequest) -> tuple[str, int]:
@@ -104,7 +63,6 @@ def _http_target(req: http_parser.HTTPRequest) -> tuple[str, int]:
         return h, int(p)
     return host_hdr, 80
 
-
 def _to_relative(req: http_parser.HTTPRequest) -> http_parser.HTTPRequest:
     """Return a copy of *req* with an absolute-URL path stripped to relative."""
     if not req.path.startswith(("http://", "https://")):
@@ -113,19 +71,10 @@ def _to_relative(req: http_parser.HTTPRequest) -> http_parser.HTTPRequest:
     rel = (parsed.path or "/") + (("?" + parsed.query) if parsed.query else "")
     return dataclasses.replace(req, path=rel)
 
-
 # CONNECT tunnel handler
 def handle_connect(client_socket: socket.socket, url: str) -> None:
     """
     TLS MITM handler for HTTPS CONNECT requests.
-
-    Flow:
-      1. Parse host:port from the CONNECT target.
-      2. Connect to the real upstream server with TLS (verifying its cert).
-      3. Tell the client the tunnel is ready (200 Connection Established).
-      4. Wrap the client socket with TLS using a dynamically signed leaf cert.
-      5. Parse HTTP request/response pairs through the tunnel until either side
-         closes the connection or signals Connection: close.
     """
     try:
         host, port_str = url.rsplit(":", 1)
@@ -134,22 +83,12 @@ def handle_connect(client_socket: socket.socket, url: str) -> None:
         send_error(client_socket, 400, "Bad Request")
         return
 
-    if port not in ALLOWED_CONNECT_PORTS:
-        log.warning("CONNECT to disallowed port %d blocked", port)
-        send_error(client_socket, 403, "Forbidden")
-        return
-
-    # Resolve once — reuse IP to prevent DNS rebinding
-    ip = resolve_and_check(host)
-    if not ip:
-        send_error(client_socket, 403, "Forbidden")
-        return
-
-    # Connect to upstream with TLS and verify cert
+    # Connect to upstream with TLS
     try:
         raw_server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         raw_server_sock.settimeout(RELAY_TIMEOUT)
-        raw_server_sock.connect((ip, port))
+        # Directly connecting to host/port (SSRF protections removed)
+        raw_server_sock.connect((host, port))
         upstream_ctx = tls.make_upstream_context(verify=VERIFY_UPSTREAM_CERT)
         server_sock = upstream_ctx.wrap_socket(raw_server_sock, server_hostname=host)
     except ssl.SSLCertVerificationError as exc:
@@ -219,7 +158,6 @@ def handle_connect(client_socket: socket.socket, url: str) -> None:
         except Exception:
             pass
 
-
 # Plain HTTP handler
 def handle_http(
     client_socket: socket.socket,
@@ -237,11 +175,6 @@ def handle_http(
             send_error(client_socket, 400, "Bad Request")
             break
 
-        ip = resolve_and_check(host)
-        if not ip:
-            send_error(client_socket, 403, "Forbidden")
-            break
-
         # Open a new upstream connection only when target changes
         if server_socket is None or host != current_host or port != current_port:
             if server_socket:
@@ -252,7 +185,8 @@ def handle_http(
             try:
                 server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 server_socket.settimeout(RELAY_TIMEOUT)
-                server_socket.connect((ip, port))
+                # Directly connecting to host/port (SSRF protections removed)
+                server_socket.connect((host, port))
                 current_host, current_port = host, port
             except Exception as exc:
                 log.error("HTTP connect failed %s:%d — %s", host, port, exc)
@@ -261,11 +195,15 @@ def handle_http(
 
         log.info("HTTP %s %s -> %s:%d", req.method, req.path, host, port)
 
-        req = intercept.engine.intercept_request(req)
-        if req is None:
-            log.info("HTTP request to %s dropped by intercept engine", host)
-            send_error(client_socket, 502, "Bad Gateway")
+        intercepted_req = intercept.engine.intercept_request(req)
+        
+        # Check the new variable for the drop signal
+        if intercepted_req is None:
+            log.info("HTTPS request to %s dropped by intercept engine", host)
+            send_error(client_socket, 502, "Bad Gateway") 
             break
+        req = intercepted_req
+
 
         try:
             server_socket.sendall(_to_relative(req).to_bytes())
@@ -274,10 +212,13 @@ def handle_http(
             log.error("HTTP relay error for %s: %s", host, exc)
             break
 
-        resp = intercept.engine.intercept_response(resp)
-        if resp is None:
-            log.info("HTTP response from %s dropped by intercept engine", host)
+        intercepted_resp = intercept.engine.intercept_response(resp)
+        
+        if intercepted_resp is None:
+            log.info("HTTPS response from %s dropped by intercept engine", host)
             break
+            
+        resp = intercepted_resp
 
         try:
             client_socket.sendall(resp.to_bytes())
@@ -298,7 +239,6 @@ def handle_http(
             server_socket.close()
         except Exception:
             pass
-
 
 # Per-client dispatcher
 def handle_client(client_socket: socket.socket, address: tuple) -> None:
@@ -328,7 +268,6 @@ def handle_client(client_socket: socket.socket, address: tuple) -> None:
         except Exception:
             pass
 
-
 # Server entry point
 def start_proxy(host: str = "127.0.0.1", port: int = 8888) -> None:
     """Bind and serve the proxy, dispatching clients to a thread pool."""
@@ -337,19 +276,31 @@ def start_proxy(host: str = "127.0.0.1", port: int = 8888) -> None:
     proxy_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     proxy_socket.bind((host, port))
     proxy_socket.listen(socket.SOMAXCONN)
+    
+    # Allows Ctrl+C to interrupt the loop by unblocking the accept() call every second
+    proxy_socket.settimeout(1.0)
+    
     log.info("Proxy listening on %s:%d  (max workers: %d)", host, port, MAX_WORKERS)
 
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        try:
-            while True:
+    # Removed the 'with' block to prevent it from hanging on shutdown
+    pool = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+    try:
+        while True:
+            try:
                 client_socket, address = proxy_socket.accept()
+                # Use RELAY_TIMEOUT instead of None so keep-alive connections eventually die
+                client_socket.settimeout(RELAY_TIMEOUT) 
                 log.debug("Connection from %s", address)
                 pool.submit(handle_client, client_socket, address)
-        except KeyboardInterrupt:
-            log.info("Shutting down proxy...")
-        finally:
-            proxy_socket.close()
-
+            except socket.timeout:
+                # Normal behavior from the 1.0s timeout; just loop again
+                continue
+    except KeyboardInterrupt:
+        log.info("Shutting down proxy...")
+    finally:
+        proxy_socket.close()
+        pool.shutdown(wait=False)
+        os._exit(0)  # Instantly returns control to the terminal
 
 if __name__ == "__main__":
     start_proxy()
