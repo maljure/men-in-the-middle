@@ -1,6 +1,6 @@
 # Using the MITM Proxy CLI
 
-This document explains how to use our interactive command-line interface for the proxy. The CLI allows you to watch traffic, intercept requests, edit them on the fly, and replay past requests.
+This document explains how to use our interactive command-line interface for the proxy. The CLI allows you to watch traffic, intercept requests, edit them on the fly, replay past requests, and hunt for vulnerabilities using built-in scanners and fuzzers.
 
 ## Getting Started
 
@@ -50,13 +50,31 @@ Once interception is ON, matching requests will be paused in a queue.
 
 ### 3. The `step` Command Options
 When you type `step`, the proxy will show you the raw request and ask what you want to do:
-`[F]orward, [D]rop, [E]dit, or forward [A]ll?`
+`[F]orward, [D]rop, [E]dit, [S]can, [Z]Fuzz, or forward [A]ll?`
 
 * **F (Forward)**: Send the request to the server exactly as it is.
 * **D (Drop)**: Kill the request. The server will never see it.
 * **E (Edit)**: Opens the request in your default text editor (e.g., Notepad). 
   * *Workflow:* Make your changes -> **Save the file** -> **Close the window**. The proxy will automatically forward your modified request. *(Note: If you change the length of a POST body, remember to update the `Content-Length` header!)*
+* **S (Scan)**: Immediately runs the active directory fuzzer against the target host to look for hidden files and folders. Returns you to the prompt so you can still Forward/Drop the request afterwards.
+* **Z (Fuzz)**: Interactive Template "Sniper" Fuzzer. Opens the request in Notepad. Replace any value with the literal word `FUZZ` (e.g., `Cookie: session=FUZZ`). Save and close, and the proxy will automatically attack that exact spot with payloads.
 * **A (All)**: Forwards the current request, turns intercept `OFF`, and flushes the rest of the queue. Use this when you are done and want the page to finish loading normally.
+
+---
+
+## Scanning & Fuzzing (Vulnerability Hunting)
+
+You can run automated attacks against historical requests stored in your database. 
+
+* **`scan <id> [--dir]`**
+  Runs passive vulnerability scanners against a specific historical response to check for missing security headers and exposed sensitive data (API keys, PII). 
+  * *Example:* `scan 15` (Passive only)
+  * *Example:* `scan 15 --dir` (Runs passive checks, PLUS actively attacks the host looking for hidden directories).
+
+* **`fuzz <id> [wordlist.txt]`**
+  Automated Semantic Fuzzer. Takes a historical request, automatically parses it, and systematically injects payloads into **every single** URL parameter, JSON body field, form input, and HTTP header. 
+  * *Example:* `fuzz 24` (Uses default payloads: SQLi, XSS, Path Traversal, etc.)
+  * *Example:* `fuzz 24 custom_payloads.txt` (Uses your own custom payload list).
 
 ---
 

@@ -34,6 +34,14 @@ ERROR_PATTERNS: list[str] = [
     "warning: include", "failed to open stream",
     # Generic
     "internal server error", "undefined variable", "undefined index",
+    # NoSQL Injection (MongoDB, etc.)
+    '{"$gt": ""}', '{"$ne": null}', '{"$where": "1==1"}',
+    # SSRF & Open Redirect
+    "http://127.0.0.1", "http://localhost", "file:///etc/passwd", "//google.com",
+    # CRLF / HTTP Header Injection
+    "%0d%0aX-Injected: true", "\r\nSet-Cookie: injected=1",
+    # XXE (XML External Entity)
+    '<!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]>',
 ]
  
 # Headers to fuzz (skip security-sensitive ones that would break the connection)
@@ -48,7 +56,7 @@ FUZZABLE_HEADERS = {
 DEFAULT_PAYLOADS: list[str] = [
     # SQL injection
     "'", "''", "' OR '1'='1", "' OR 1=1--", "\" OR \"1\"=\"1",
-    "1; DROP TABLE users--", "1' AND SLEEP(5)--", "1; WAITFOR DELAY '0:0:5'--",
+    "1; SELECT @@version--", "1' AND SLEEP(5)--", "1; WAITFOR DELAY '0:0:5'--",
     "' UNION SELECT NULL--", "' UNION SELECT NULL,NULL--",
     # XSS
     "<script>alert(1)</script>", "<img src=x onerror=alert(1)>",

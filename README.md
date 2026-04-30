@@ -56,7 +56,7 @@
 
 ---
 
-## Phase 6 — Vulnerability Scanners
+## Phase 6 — Vulnerability Scanners $${\color{green}COMPLETE}$$
 
 Build a scanner plugin interface — each scanner receives a request object and returns findings.
 
@@ -79,7 +79,7 @@ Build a scanner plugin interface — each scanner receives a request object and 
 
 ---
 
-## Phase 8 — Reporting
+## Phase 8 — Reporting $${\color{red} NO LONGER DOING}$$
 
 - Aggregate findings from all scanners per host
 - Severity classification: Info / Low / Medium / High
@@ -87,6 +87,3 @@ Build a scanner plugin interface — each scanner receives a request object and 
 - Deduplicate findings
 
 ---
-
-Phases 1 and 2 are blockers — nothing else works without TLS interception and a proper HTTP parser.
-The CLI in Phase 5 makes everything from Phase 6 onward much easier to develop and debug interactively.

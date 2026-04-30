@@ -6,12 +6,13 @@ import tempfile
 import threading
 import time
 import json
+import re
 
 import proxy
 import history
 import intercept
 import fuzzer
-from http_parser import HTTPRequest
+from http_parser import HTTPRequest, HTTPResponse
 
 # Force all proxy logs into a file instead of the terminal!
 logging.basicConfig(
@@ -140,7 +141,7 @@ class ProxyCLI(cmd.Cmd):
         print("---------------------------\n")
 
         while True:
-            choice = input("(F)orward, (D)rop, (E)dit, or forward (A)ll? [f/d/e/a]: ").strip().lower()
+            choice = input("(F)orward, (D)rop, (E)dit, (S)can, (Z)Fuzz, or forward (A)ll? [f/d/e/s/z/a]: ").strip().lower()
             if choice == 'f':
                 intercept.engine.forward(item.id)
                 print("[+] Forwarded.")
@@ -158,12 +159,21 @@ class ProxyCLI(cmd.Cmd):
                     print("[!] Edit cancelled or invalid. Forwarding original request.")
                     intercept.engine.forward(item.id)
                 break
+            elif choice == 's':
+                import scanner
+                host, port = proxy._http_target(item.request)
+                protocol = "https" if port == 443 else "http"
+                findings = scanner.scan_directories(host=host, port=port, protocol=protocol)
+                scanner.print_findings(findings)
+            elif choice == 'z':
+                host, port = proxy._http_target(item.request)
+                protocol = "https" if port == 443 else "http"
+                self._interactive_fuzz(item.request, host, port, protocol)
+                # Notice no 'break' here! After the fuzzer runs, the prompt returns
+                # so you can still Forward or Drop the original intercepted request.
             elif choice == 'a':
-                # 1. Forward the current item
                 intercept.engine.forward(item.id)
-                # 2. Turn off the intercept engine so no new requests get caught
                 intercept.engine.enabled = False
-                # 3. Flush whatever else is already sitting in the queue
                 self.do_flush("") 
                 print("[+] Intercept turned OFF. All pending requests forwarded.")
                 break
@@ -187,6 +197,78 @@ class ProxyCLI(cmd.Cmd):
         except Exception as e:
             print(f"Error parsing modified request: {e}")
             return None
+    def _interactive_fuzz(self, item_req: HTTPRequest, host: str, port: int, protocol: str):
+        """Opens the request in an editor to let the user place a FUZZ marker, then runs the fuzzer."""
+        print("\n[*] Opening request in editor. Replace the exact target value with the word 'FUZZ' (all caps).")
+        print("[*] Example: Cookie: session=FUZZ")
+        input("Press Enter to open editor...")
+
+        editor = os.environ.get('EDITOR', 'notepad' if os.name == 'nt' else 'nano')
+        with tempfile.NamedTemporaryFile(suffix=".http", delete=False) as tf:
+            tf.write(item_req.to_bytes())
+            tmp_name = tf.name
+
+        subprocess.call([editor, tmp_name])
+
+        with open(tmp_name, 'rb') as f:
+            template_bytes = f.read()
+        os.unlink(tmp_name)
+
+        if b"FUZZ" not in template_bytes:
+            print("[-] Marker 'FUZZ' not found in the edited request. Aborting fuzzer.")
+            return
+
+        print(f"[*] 'FUZZ' marker found! Starting fuzzer against {host}...")
+        
+        # 1. Establish Baseline using the ORIGINAL request
+        try:
+            baselineResp, baselineTime = fuzzer.sendRequest(item_req, host, port, protocol)
+        except Exception as e:
+            print(f"[-] Baseline request failed: {e}")
+            return
+            
+        results = []
+        payloads = fuzzer.DEFAULT_PAYLOADS 
+        
+        print(f"[*] Testing {len(payloads)} payloads...")
+        for payload in payloads:
+            # 2. Mutate raw bytes exactly where the user placed 'FUZZ'
+            mutated_bytes = template_bytes.replace(b"FUZZ", payload.encode('utf-8'))
+            
+            # 3. Fix Content-Length safely BEFORE parsing so payloads don't get truncated
+            header_part, sep, body_part = mutated_bytes.partition(b"\r\n\r\n")
+            if body_part and b"Content-Length:" in header_part:
+                header_text = header_part.decode('utf-8', errors='replace')
+                header_text = re.sub(r'(?i)Content-Length:\s*\d+', f'Content-Length: {len(body_part)}', header_text)
+                mutated_bytes = header_text.encode('utf-8') + sep + body_part
+
+            # 4. Parse the newly mutated bytes and send
+            try:
+                mutated_req = HTTPRequest.from_bytes(mutated_bytes)
+                fuzzResp, fuzzTime = fuzzer.sendRequest(mutated_req, host, port, protocol)
+                
+                # 5. Diff against baseline
+                anomalies, errorMatches = fuzzer.checkAnomalies(
+                    baselineResp, baselineTime, fuzzResp, fuzzTime
+                )
+                
+                if anomalies:
+                    results.append(fuzzer.FuzzResult(
+                        injectionPoint="Custom 'FUZZ' marker",
+                        payload=payload,
+                        baselineStatus=baselineResp.status_code,
+                        fuzzStatus=fuzzResp.status_code,
+                        baselineLength=len(baselineResp.body or b""),
+                        fuzzLength=len(fuzzResp.body or b""),
+                        baselineTime=baselineTime,
+                        fuzzTime=fuzzTime,
+                        anomalies=anomalies,
+                        errorMatches=errorMatches,
+                    ))
+            except Exception:
+                pass # Drop silent on network failures for individual fuzz requests
+                
+        fuzzer.printResults(results)
 
     # --- History and Replay ---
 
@@ -244,6 +326,86 @@ class ProxyCLI(cmd.Cmd):
             print(f"[+] Body Size: {len(resp.body or b'')} bytes.")
         except Exception as e:
             print(f"[-] Replay failed: {e}")
+
+    def do_scan(self, arg):
+        """scan <id> [--dir] : Run vulnerability scanners on a captured request/response.
+        Use --dir to also run the active directory fuzzer against the host."""
+        import scanner 
+        
+        args = arg.split()
+        if not args or not args[0].isdigit():
+            print("Usage: scan <id> [--dir]")
+            return
+            
+        flow_id = int(args[0])
+        run_dir_scan = "--dir" in args
+        
+        row = history.getFlow(flow_id)
+        
+        if not row or not row["resp_status"]:
+            print(f"Flow {flow_id} not found, or it doesn't have a response to scan.")
+            return
+
+        # Reconstruct the response object for passive scanning
+        raw_headers = json.loads(row["resp_headers"])
+        headers = {k.lower(): v for k, v in raw_headers}
+        resp = HTTPResponse(
+            version=row["resp_version"],
+            status_code=row["resp_status"],
+            reason=row["resp_reason"],
+            headers=headers,
+            raw_headers=raw_headers,
+            body=row["resp_body"] or b""
+        )
+
+        findings = []
+        
+        # 1. Run passive scanners (analyzing the captured traffic)
+        print("[*] Running passive scanners...")
+        findings.extend(scanner.scan_headers(resp))
+        findings.extend(scanner.scan_sensitive_data(resp))
+        
+        # 2. Run active scanners (sending new traffic)
+        if run_dir_scan:
+            findings.extend(scanner.scan_directories(
+                host=row["host"],
+                port=row["port"],
+                protocol=row["protocol"]
+            ))
+        
+        scanner.print_findings(findings)
+    def do_fuzz(self, arg):
+        """fuzz <id> [wordlist] : Automatically fuzz all parameters, JSON fields, and headers of a historical request.
+        Examples:
+          fuzz 12
+          fuzz 12 payloads/sqli.txt
+        """
+        args = arg.split()
+        if not args or not args[0].isdigit():
+            print("Usage: fuzz <id> [wordlist.txt]")
+            return
+            
+        flow_id = int(args[0])
+        wordlist_path = args[1] if len(args) > 1 else None
+        
+        try:
+            payloads = fuzzer.DEFAULT_PAYLOADS
+            if wordlist_path:
+                print(f"[*] Loading custom wordlist from {wordlist_path}...")
+                payloads = fuzzer.loadWordlist(wordlist_path)
+                
+            print(f"[*] Starting automated semantic fuzzer on flow {flow_id}...")
+            
+            # This calls the powerful automated fuzzer you built in fuzzer.py!
+            results = fuzzer.fuzzFlow(flow_id, payloads=payloads)
+            fuzzer.printResults(results)
+            
+        except FileNotFoundError:
+            print(f"[-] Wordlist not found: {wordlist_path}")
+        except ValueError as e:
+            print(f"[-] Error: {e}")
+        except Exception as e:
+            print(f"[-] Fuzzer failed: {e}")
 
     # --- Utilities ---
 
