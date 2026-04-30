@@ -79,7 +79,7 @@ Build a scanner plugin interface — each scanner receives a request object and 
 
 ---
 
-## Phase 8 — Reporting $${\color{red} NO~LONGER~DOING}$$
+## Phase 8 — Reporting $${\color{red} NO/space LONGER/space DOING}$$
 
 - Aggregate findings from all scanners per host
 - Severity classification: Info / Low / Medium / High
