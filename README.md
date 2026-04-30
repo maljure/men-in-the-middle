@@ -70,7 +70,7 @@ Build a scanner plugin interface — each scanner receives a request object and 
 
 ---
 
-## Phase 7 — Fuzzer || $${\color{green}\textCOMPLETE}$$
+## Phase 7 — Fuzzer || $${\color{green}COMPLETE}$$
 
 - Build a wordlist/payload loader
 - Identify injectable points in a request automatically (params, headers, body fields)
@@ -79,7 +79,7 @@ Build a scanner plugin interface — each scanner receives a request object and 
 
 ---
 
-## Phase 8 — Reporting $${\color{red}\text{NO LONGER DOING}}$$
+## Phase 8 — Reporting $${\color{red}\text{DISCONTINUED}}$$
 
 - Aggregate findings from all scanners per host
 - Severity classification: Info / Low / Medium / High
