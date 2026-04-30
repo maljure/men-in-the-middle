@@ -27,7 +27,7 @@ def connection():
 def tx():
     conn = connection()
     try:
-        yield connection
+        yield conn
         conn.commit()
     except Exception:
         conn.rollback()
@@ -166,10 +166,10 @@ def log_flow(
                 "reason": resp.reason if resp else None,
                 "rver": resp.version if resp else None,
                 "resp_hdrs": convertHeadersToJson(resp.raw_headers) if resp else None,
-                "resp_body": resp.body or None,
+                "resp_body": resp.body if resp else None,
                 "resp_mod_hdrs": resp_mod_headers,
                 "resp_mod_body": resp_mod_body,
-                "ct": _content_type(resp.headers) if resp else None,
+                "ct": contentType(resp.headers) if resp else None,
                 "size": len(resp.body) if resp else None,
             },
         )
@@ -289,11 +289,11 @@ def stats() -> dict[str, object]:
         """
     ).fetchone()
  
-    by_method: list[sqlite3.Row] = _conn().execute(
+    by_method: list[sqlite3.Row] = connection().execute(
         "SELECT req_method, COUNT(*) AS n FROM flows GROUP BY req_method ORDER BY n DESC"
     ).fetchall()
  
-    by_status: list[sqlite3.Row] = _conn().execute(
+    by_status: list[sqlite3.Row] = connection().execute(
         "SELECT resp_status, COUNT(*) AS n FROM flows GROUP BY resp_status ORDER BY n DESC"
     ).fetchall()
  
