@@ -37,7 +37,7 @@
 
 ---
 
-## Phase 4 — History Log || $${\color{orange}IN PROGRESS - MASON}$$
+## Phase 4 — History Log || $${\color{green}COMPLETE}$$
 
 - Store every request/response pair to SQLite
 - Index by host, method, status code, timestamp
@@ -70,7 +70,7 @@ Build a scanner plugin interface — each scanner receives a request object and 
 
 ---
 
-## Phase 7 — Fuzzer
+## Phase 7 — Fuzzer || $${\color{green}COMPLETE}$$
 
 - Build a wordlist/payload loader
 - Identify injectable points in a request automatically (params, headers, body fields)
