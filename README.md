@@ -79,7 +79,7 @@ Build a scanner plugin interface — each scanner receives a request object and 
 
 ---
 
-## Phase 8 — Reporting $${\color{red}\text{DISCONTINUED}}$$
+## Phase 8 — Reporting || $${\color{red}\text{DISCONTINUED}}$$
 
 - Aggregate findings from all scanners per host
 - Severity classification: Info / Low / Medium / High
