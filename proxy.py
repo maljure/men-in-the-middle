@@ -23,7 +23,7 @@ log = logging.getLogger(__name__)
 MAX_WORKERS = 100
 
 # Relay/read timeout
-RELAY_TIMEOUT = 10
+RELAY_TIMEOUT = 300
 
 # Maximum size of HTTP request headers
 MAX_HEADER_SIZE = 65536
