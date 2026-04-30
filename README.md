@@ -70,7 +70,7 @@ Build a scanner plugin interface — each scanner receives a request object and 
 
 ---
 
-## Phase 7 — Fuzzer || $${\color{green}COMPLETE}$$
+## Phase 7 — Fuzzer || $${\color{green}\textCOMPLETE}$$
 
 - Build a wordlist/payload loader
 - Identify injectable points in a request automatically (params, headers, body fields)
